@@ -10,25 +10,20 @@ class VideoData(object):
     def __init__(self, data_path, dim):
         self.data_file = h5py.File(data_path) # load *.h5 file
         self.dim = dim # for FCSN use 1D or 2D conv
+        self.videos = list(self.data_file.keys())
 
     def __len__(self):
         return len(self.data_file.keys()) # a number of keys in [video_1, video_11 ......]
 
     def __getitem__(self, index):
-        index = index+1 # because the video is start from 1
-        video_name = "video_{}".format(index)
-        video = self.data_file[video_name] # get specific video
+        video = self.data_file[self.videos[index]]
 
-        if self.dim=="1D": # for FCSN_1D
-            video_feature = torch.from_numpy(video["feature"][...]).transpose(1,0).view(1024,-1) # [320,1024] -> [1024,320]
-        else:
-            video_feature = torch.from_numpy(video["feature"][...]).transpose(1,0).view(1024,1,-1) #[320,1024] -> [1024,1,320]
-
+        video_feature = torch.from_numpy(video["feature"][...]).transpose(1,0).view(1024,-1) # [320,1024] -> [1024,320]
         video_label = torch.from_numpy(video["label"][...]).type(torch.long) # [320,]
         
         return video_feature,video_label,index
 
-def get_loader(path, dim, batch_size=5):
+def get_loader(path, dim, batch_size=5, split_times=5):
     """
     dim=1D prepare for FCSN_1D
     dim=2D prepare for FCSN_2D
@@ -38,12 +33,9 @@ def get_loader(path, dim, batch_size=5):
     train_loader_list = []
     test_dataset_list = []
 
-    # split 5 times for validation
-    split_times = 5
-
     for i in range(split_times):
         # train_dataset: [(video_index1_feature,video_index1_label,index1)...]
-        train_dataset,test_dataset = torch.utils.data.random_split(dataset, [int(dataset.__len__()*0.8), int(dataset.__len__()*0.2)])
+        train_dataset,test_dataset = torch.utils.data.random_split(dataset, [len(dataset) - len(dataset) // 5, len(dataset) // 5])
 
         # shuffle (bool, optional): set to `True` to have the data reshuffled at every epoch
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size, shuffle=True)
@@ -60,4 +52,3 @@ def get_loader(path, dim, batch_size=5):
 
 if __name__ == "__main__":
     train_loader_list,test_dataset_list,data_file = get_loader("datasets/fcsn_tvsum.h5", "1D", 5)
-

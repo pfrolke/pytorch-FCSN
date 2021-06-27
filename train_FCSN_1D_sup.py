@@ -1,156 +1,186 @@
 import numpy as np
-import time
+from tqdm import trange
 import matplotlib.pyplot as plt
+import json
+import os
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tensorboardX import SummaryWriter
+from torch.optim import optimizer
+from tqdm.std import tqdm
 
 from data_loader import get_loader
 from FCSN import *
 import eval_tools
+import sys
 
-# configure training record
-#writer = SummaryWriter()
-# batch_size
-BATCH_SIZE = 5
+# Hyperparameters
+BATCH_SIZE = 3
+LR = 1e-3
+MOMENTUM = 0.9
+EPOCHS = 100
+INTER_METHOD = "cut"
+
 # load training and testing dataset
-train_loader_list,test_dataset_list,data_file = get_loader("datasets/fcsn_summe.h5", "1D", BATCH_SIZE)
+train_loader_list, test_dataset_list, data_file = get_loader(
+    "../fcsn_breakfast_summarization_dataset_keyframe.hdf5", "1D", BATCH_SIZE, 5)
 # device use for training and testing
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-# number of epoch to train
-EPOCHS = 100
+
 # array for calc. eval fscore
 fscore_arr = np.zeros(len(train_loader_list))
 
+model_num = len(os.listdir("scores"))
+data_name = "breakfast"
 
 
-for i in range(len(train_loader_list)):
+def batch_loss(outputs, labels, class_weights):
+    classification_loss_sum = 0
+
+    cur_batch_size = labels.shape[0]
+    for k in range(cur_batch_size):
+        # get one output / label pair
+        cur_outputs = outputs[k, :, :].permute(1, 0)  # [2,320]->[320,2]
+        cur_label = labels[k, :]  # [320]
+
+        criterion = nn.NLLLoss(weight=class_weights)
+
+        log_p = torch.log(cur_outputs)
+
+        classification_loss_sum += criterion(log_p, cur_label)
+
+    return classification_loss_sum / cur_batch_size
+
+
+def compute_class_weights(train_set):
+    class_sample_count = np.zeros(2)
+    n_samples = 0
+    for _, label, _ in train_set:
+        class_sample_count += np.unique(label, return_counts=True)[1]
+        n_samples += label.shape[0]
+
+    # "freq_c is the number of frames with label c divided by the total number of frames in videos where label c is present"
+    freq_c = class_sample_count / n_samples
+    median_freq = np.median(freq_c) 
+    class_weights = median_freq / freq_c
+
+    return torch.tensor(class_weights, device=device, dtype=torch.float)
+
+
+for i in trange(len(train_loader_list), desc="split", leave=False):
+    # plotting
+    plt_epochs = []
+    plt_losses = []
+    plt_t_losses = []
+    plt_t_epochs = []
+
     # model declaration
     model = FCSN_1D_sup()
     # optimizer declaration
     optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.9)
-    # switch to train mode
-    model.train()
+    # optimizer = optim.Adam(model.parameters())
+
     # put model in to device
     model.to(device)
 
+    class_weights = compute_class_weights(train_loader_list[i])
 
-    for epoch in range(EPOCHS):
-        for batch_i, (feature,label,_) in enumerate(train_loader_list[i]):
-            feature = feature.to(device) #[5,1024,320]
-            label = label.to(device) #[5,320]
-            outputs = model(feature) # output shape [5,2,320]
+    for epoch in trange(EPOCHS, desc="epoch", leave=False):
+        model.train()
+        train_losses = []
+        for batch_i, (feature, label, _) in enumerate(train_loader_list[i]):
+            feature = feature.to(device)  # [5,1024,320]
+            label = label.to(device)  # [5,320]
+            outputs = model(feature)  # output shape [5,2,320]
 
-            
             # zero the parameter gradients
             optimizer.zero_grad()
 
-            # cross entropy loss
-            classification_loss_sum = 0
-            # for one movie each
-            for k in range(BATCH_SIZE):
-                label_each = label[k,:] #[320]
-                outputs_each = outputs[k,:,:].permute(1,0) #[2,320]->[320,2]
+            total_loss = batch_loss(outputs, label, class_weights)
 
-                # loss criterion
-                label_each_float = label_each.type(torch.float)
-                label_0 = 0.5*label_each_float.shape[0]/(label_each_float.shape[0]-label_each_float.sum())
-                label_1 = 0.5*label_each_float.shape[0]/label_each_float.sum()
-                weights = torch.tensor([label_0,label_1], dtype=torch.float, device=device)
-                criterion = nn.CrossEntropyLoss(weight=weights)
+            train_losses.append(total_loss.item())
 
-                classification_loss_sum += criterion(outputs_each, label_each)
-
-            classification_loss = classification_loss_sum/BATCH_SIZE
-            
-            # variance loss
-            # score = torch.softmax(outputs, dim=1) #[5,2,320]
-            # eps = 1e-8
-            # med_score,_ = torch.median(score, dim=1, keepdim=True) #[5,1]
-            # batch_variance = torch.mean((score-med_score)**2, dim=1) #[5]
-            # batch_variance_loss = 1.0/(batch_variance+eps)
-            # variance_loss = torch.mean(batch_variance_loss); #print(variance_loss)
-
-            # total loss
-            total_loss = classification_loss
-            #total_loss = classification_loss+0.005*variance_loss; #print(0.005*variance_loss)
-
-            # only plot split:0 loss
-            #if i==0:
-                # tvsum: 1 epoch has 8 iter.
-                #iteration = len(train_loader_list[i])*epoch+batch_i; #print(len(train_loader_list[i]), epoch, batch_i,iteration)
-                #writer.add_scalar("sup_tvsum_1D/split_0_loss_classification", classification_loss, iteration, time.time())   # tag, Y, X -> 當Y只有一個時
-                #writer.add_scalar("sup_loss_1D_X_batch/unscaled_variance_loss", variance_loss, iteration, time.time())   # tag, Y, X -> 當Y只有一個時
-                #writer.add_scalar("sup_loss_1D_X_batch/total_loss_scaled", total_loss, iteration, time.time())   # tag, Y, X -> 當Y只有一個時
-            
             total_loss.backward()
             optimizer.step()
 
+        # plotting loss
+        train_loss_avg = np.mean(train_losses)
+        plt_epochs.append(epoch)
+        plt_losses.append(train_loss_avg)
+
         # eval every 5 epoch
-        if(epoch+1)%5 == 0:
-            #print(i, epoch, total_loss)
+        if(epoch+1) % 5 == 0:
+            eval_res_avg = []  # for all testing video results
             model.eval()
-            eval_res_avg = [] # for all testing video results
-            for j, (feature,label,index) in enumerate(test_dataset_list[i], 1): # index has been +1 in dataloader.py
-                feature = feature.view(1,1024,-1).to(device) # [1024,320] -> [1,1024,320]
-                pred_score = model(feature).view(-1,320) # [1,2,320] -> [2,320]
-                # we only want key frame prob. -> [1]
-                pred_score = torch.softmax(pred_score, dim=0)[1] # [320]
+
+            score_dict = {}
+
+            for j, (feature, label, index) in enumerate(test_dataset_list[i], 1):
+                # [1024,320] -> [1,1024,320]
+                feature = feature.view(1, 1024, -1).to(device)
+
+                # [1,2,320] -> [320]
+                pred_score = model(feature).view(-1, label.shape[0])[1]
                 
-                #print("epoch:{:0>3d} video_index:{:0>2d} key_frame_score(first20):{}".format(epoch, index, pred_score[:20]))
-                
-                video_name = "video_{}".format(index)
+                video_name = list(data_file.keys())[index]
                 video_info = data_file[video_name]
+
                 # select key shots by video_info and pred_score
                 # pred_summary: [N] binary keyshot
-                N, pred_score_upsample, _, pred_summary = eval_tools.select_keyshots(video_info, pred_score)
-                true_summary_arr = video_info['user_summary'][()] # shape (n_users,N), summary from some users, each row is a binary vector
-                eval_res = [eval_tools.eval_metrics(pred_summary, true_summary) for true_summary in true_summary_arr] # shape [n_user,3],3 for[precision, recall, fscore]
-                #eval_res = np.mean(eval_res, axis=0).tolist()  # for tvsum
-                eval_res = np.max(eval_res, axis=0).tolist()    # for summe
-                eval_res_avg.append(eval_res) # [[precision1, recall1, fscore1], [precision2, recall2, fscore2]......]
+                pred_score_upsample, pred_summary = eval_tools.select_keyshots(
+                    video_info, pred_score, inter_method=INTER_METHOD)
 
-                # plot split 0 and first test histogram only save epoch4 and epoch last
-                # if (i==0 and j==1 and (epoch==4 or epoch==EPOCHS-1)):
-                #     fig, ax = plt.subplots(nrows=2, ncols=1, figsize=(100, 60))
-                #     ax[0].bar(list(range(320)), pred_score.tolist(), alpha=1.0, width=0.6)
-                #     ax[0].set_xlabel('frame_index', fontsize=50)  
-                #     ax[0].set_ylabel('Probability', fontsize=50)
-                #     ax[0].tick_params(axis='both', which='major', labelsize=50)
-                #     ax[1].bar(list(range(N)), pred_score_upsample, alpha=0.5, width=0.6) 
-                #     ax[1].bar(list(range(N)), pred_summary, alpha=0.8, width=0.6) 
-                #     ax[1].set_xlabel('frame_index', fontsize=50)  
-                #     ax[1].set_ylabel('Probability', fontsize=50)
-                #     ax[1].tick_params(axis='both', which='major', labelsize=50)
-                #     fig.savefig("imgs/summe_1D_split{}_epoch{:0>3d}_video{}.png".format(i, epoch, index))
-                #     plt.close() # close a current window
+                score_dict[video_name] = pred_score_upsample
 
+                # [n_users,N]
+                true_summary_arr = video_info['user_summary'][()]
+                eval_res = [eval_tools.eval_metrics(
+                    pred_summary, true_summary) for true_summary in true_summary_arr]  # [n_user,3]
 
-                
-            eval_res_avg = np.mean(eval_res_avg, axis=0).tolist()
-            precision = eval_res_avg[0]
-            recall = eval_res_avg[1]
-            fscore = eval_res_avg[2]
-            print("split:{} epoch:{:0>3d} precision:{:.1%} recall:{:.1%} fscore:{:.1%} loss:{}".format(i, epoch, precision, recall, fscore, total_loss))
+                # mean of [precision, recall, fscore]
+                eval_res = np.mean(eval_res, axis=0).tolist()
 
-            model.train()
+                # kendall = eval_tools.rankcorrelation_kendall(
+                #     np.array(pred_score_upsample), video_info['gtscore'][()])
+                kendall = 0
+                eval_res_avg.append(np.append(eval_res, kendall))
 
-            # store the last fscore for eval, and remove model from GPU
-            if((epoch+1)==EPOCHS):
-                # store fscore
-                fscore_arr[i] = fscore
-                #print("split:{} epoch:{:0>3d} precision:{:.1%} recall:{:.1%} fscore:{:.1%}".format(i, epoch, precision, recall, fscore))
-                # release model from GPU
-                model = model.cpu()
-                torch.cuda.empty_cache()
+            eval_res_avg = np.mean(eval_res_avg, axis=0)
 
-            #writer.add_scalar("eval_1D_X_epoch/precision", precision, epoch, time.time())   # tag, Y, X -> 當Y只有一個時
-            #writer.add_scalar("eval_1D_X_epoch/recall", recall, epoch, time.time())
-            #writer.add_scalar("eval_1D_X_epoch/fscore", fscore, epoch, time.time())
+            tqdm.write(
+                f"split:{i} epoch:{epoch:0>3d} precision:{eval_res_avg[0]:.1%} recall:{eval_res_avg[1]:.1%} fscore:{eval_res_avg[2]:.1%} kendalltau: {eval_res_avg[3]:.3f} loss:{train_loss_avg:.4f}")
 
-            
+        # store the last fscore for eval, and remove model from GPU
+        if((epoch+1) == EPOCHS):
+            # store model
+            torch.save(model.state_dict(
+            ), f"trained/{model_num}-{data_name}-split_{i}-epoch_{epoch}.pkl")
+
+            # store scores
+            json_data = score_dict
+            if os.path.exists(f"scores/{model_num}-{data_name}.json"):
+                with open(f"scores/{model_num}-{data_name}.json", 'r') as f:
+                    json_data.update(json.load(f))
+
+            with open(f"scores/{model_num}-{data_name}.json", 'w') as f:
+                json.dump(json_data, f)
+
+            # store fscore
+            fscore_arr[i] = eval_res_avg[2]
+
+            # release model from GPU
+            model = model.cpu()
+            torch.cuda.empty_cache()
+
+    plt.title("Epoch loss")
+    plt.xlabel("Epochs")
+    plt.ylabel("Mean loss")
+    plt.ylim(0, 1)
+    plt.plot(plt_epochs, plt_losses)
+    plt.savefig(f"losses/{model_num}-{data_name}-split_{i}.pdf")
+    plt.clf()
+
 
 # print eval fscore
-print("summe average fscore:{:.1%}".format(fscore_arr.mean()))
+print("{} average fscore:{:.1%}".format(data_name, fscore_arr.mean()))
